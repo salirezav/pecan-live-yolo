@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+.venv-spinnaker/
+venv/
+env/
+
+# Build and IDE
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Python
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+
+# Local weights (copy from training_runs or set PECAN_*_WEIGHTS)
+training_runs/
+weights/*.pt
+!weights/.gitkeep
+!weights/README.md
+
+# Ultralytics default output
+/runs/
