@@ -1,13 +1,14 @@
 r"""Live camera + YOLO-seg overlay (OpenCV windows).
 
-Backends: Teledyne Spinnaker, OpenCV webcam, or a video file.
+Backends: OpenCV DirectShow (ELP UVC), Teledyne Spinnaker, or a video file.
 
-Run with the Spinnaker env:
-  .venv-spinnaker\Scripts\python.exe scripts/live_yolo.py
+Run with the project env:
+  .venv\Scripts\python.exe scripts/live_yolo.py
 Or double-click ``scripts/run_live_yolo.bat``.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -72,22 +73,62 @@ def resolve_yolo_device(device: str) -> str:
 
 # --- model ---
 REPO_ROOT = Path(__file__).resolve().parent.parent
+WEIGHTS_DIR = REPO_ROOT / "weights"
 RUNS_ROOT = REPO_ROOT / "training_runs" / "yolo_seg_runs"
+# Local demo YOLO-seg checkpoint (also under weights/ as demo-yolo-seg.pt).
 RUN_NAME = os.environ.get("PECAN_YOLO_RUN", "2026-08-19_131846")
 # Dirty live-test switch. Flip back to "yolo" to use the YOLO-seg weights.
 MODEL_BACKEND = "yolo"  # "yolo" | "cascade"
-_CASCADE_DEFAULT = (
+_CASCADE_LOCAL = WEIGHTS_DIR / "literally the best.pt"
+_CASCADE_RUNS = (
     REPO_ROOT / "training_runs" / "cascade_seg_runs" / "literally the best.pt"
 )
+_CASCADE_DEFAULT = _CASCADE_LOCAL if _CASCADE_LOCAL.is_file() else _CASCADE_RUNS
 CASCADE_WEIGHTS_PATH = Path(
     os.environ.get("PECAN_CASCADE_WEIGHTS", str(_CASCADE_DEFAULT))
 )
-_YOLO_DEFAULT = RUNS_ROOT / RUN_NAME / f"{RUN_NAME}.pt"
-_yolo_env = os.environ.get("PECAN_YOLO_WEIGHTS")
+
+
+def resolve_yolo_weights(
+    name_or_path: str | Path | None = None,
+    *,
+    run_name: str | None = None,
+) -> Path:
+    """Resolve a YOLO ``.pt`` from env, ``weights/``, or ``training_runs/``."""
+    env = os.environ.get("PECAN_YOLO_WEIGHTS")
+    if env:
+        return Path(env)
+
+    raw = name_or_path
+    if raw is None:
+        raw = run_name or RUN_NAME
+    path = Path(raw)
+    if path.is_file():
+        return path
+
+    stem = path.name
+    candidates = [
+        WEIGHTS_DIR / stem,
+        WEIGHTS_DIR / f"{stem}.pt" if not stem.endswith(".pt") else None,
+        WEIGHTS_DIR / "demo-yolo-seg.pt" if str(stem).startswith("2026-08-19") else None,
+        RUNS_ROOT / path.stem / f"{path.stem}.pt",
+        RUNS_ROOT / stem / f"{stem}.pt" if not stem.endswith(".pt") else None,
+        RUNS_ROOT / stem,
+    ]
+    for cand in candidates:
+        if cand is not None and cand.is_file():
+            return cand
+    # Prefer the local weights copy in error messages when the run folder is absent.
+    local = WEIGHTS_DIR / (stem if stem.endswith(".pt") else f"{stem}.pt")
+    return local if not (RUNS_ROOT / path.stem / f"{path.stem}.pt").exists() else (
+        RUNS_ROOT / path.stem / f"{path.stem}.pt"
+    )
+
+
 WEIGHTS_PATH = (
     CASCADE_WEIGHTS_PATH
     if MODEL_BACKEND == "cascade"
-    else (Path(_yolo_env) if _yolo_env else _YOLO_DEFAULT)
+    else resolve_yolo_weights(RUN_NAME)
 )
 CONF = 0.25
 DEVICE = "auto"  # auto | cpu | 0 (first CUDA GPU)
@@ -99,11 +140,21 @@ CLASS_COLORS_BGR = {
     "pecan": (0, 140, 255),   # orange
     "kernel": (40, 220, 40),  # green
     "crack": (0, 40, 255),    # red (cascade U-Net only)
+    # half-yield-analysis classes
+    "half": (0, 200, 255),
+    "piece": (40, 220, 40),
+    "shell": (0, 140, 255),
+    "obscured": (180, 180, 180),
 }
 
 # --- camera ---
-CAMERA_BACKEND = "spinnaker"  # "spinnaker" | "opencv" | "video"
+CAMERA_BACKEND = "opencv"  # "opencv" | "spinnaker" | "video"
 CAMERA_INDEX = 0
+# Prefer this DirectShow / PnP friendly name (ELP AR0234). Empty = use CAMERA_INDEX.
+OPENCV_CAMERA_NAME = "Global Shutter Camera"
+# Default grab sizes for the ELP global shutter (MJPEG). HQ Grab toggles these.
+OPENCV_FAST_SIZE = (1280, 720)
+OPENCV_HQ_SIZE = (1920, 1200)
 SPINNAKER_CAMERA_INDEX = 0
 # Pin the GigE PoE Blackfly (BFS-PGE-23S3C). Empty string = auto (prefer GigE).
 SPINNAKER_SERIAL = "26312947"
@@ -158,11 +209,75 @@ def print_env() -> None:
 
 
 def set_run(run_name: str) -> Path:
-    """Point ``WEIGHTS_PATH`` at a training run folder under ``training_runs/yolo_seg_runs``."""
+    """Point ``WEIGHTS_PATH`` at a YOLO checkpoint (``weights/`` or training run)."""
     global RUN_NAME, WEIGHTS_PATH
     RUN_NAME = str(run_name)
-    WEIGHTS_PATH = RUNS_ROOT / RUN_NAME / f"{RUN_NAME}.pt"
+    WEIGHTS_PATH = resolve_yolo_weights(run_name)
     return WEIGHTS_PATH
+
+
+def set_weights(name_or_path: str | Path) -> Path:
+    """Point ``WEIGHTS_PATH`` at a file under ``weights/`` or an absolute ``.pt`` path.
+
+    Examples:
+      set_weights("2026-08-19_131846")
+      set_weights("demo-yolo-seg.pt")
+      set_weights("halfyield-model.pt")
+    """
+    global RUN_NAME, WEIGHTS_PATH
+    WEIGHTS_PATH = resolve_yolo_weights(name_or_path)
+    RUN_NAME = WEIGHTS_PATH.stem
+    return WEIGHTS_PATH
+
+
+def list_available_weights() -> list[Path]:
+    """Sorted ``.pt`` files under ``weights/`` (non-recursive)."""
+    if not WEIGHTS_DIR.is_dir():
+        return []
+    return sorted(
+        (p for p in WEIGHTS_DIR.glob("*.pt") if p.is_file()),
+        key=lambda p: p.name.lower(),
+    )
+
+
+def choose_weights_interactive(*, default: Path | None = None) -> Path:
+    """Print available models and ask which one to load."""
+    models = list_available_weights()
+    if not models:
+        raise FileNotFoundError(
+            f"No .pt files in {WEIGHTS_DIR}. Drop checkpoints there first."
+        )
+
+    preferred = Path(default) if default is not None else Path(WEIGHTS_PATH)
+    default_idx = 0
+    for i, path in enumerate(models):
+        if path.resolve() == preferred.resolve() or path.name == preferred.name:
+            default_idx = i
+            break
+
+    print()
+    print(f"Available models in {WEIGHTS_DIR}:")
+    for i, path in enumerate(models, start=1):
+        mb = path.stat().st_size / (1024 * 1024)
+        mark = "  (default)" if (i - 1) == default_idx else ""
+        print(f"  [{i}] {path.name}  ({mb:.1f} MB){mark}")
+    print()
+
+    while True:
+        raw = input(f"Choose model [1-{len(models)}] (Enter={default_idx + 1}): ").strip()
+        if not raw:
+            choice = default_idx
+            break
+        if raw.isdigit() and 1 <= int(raw) <= len(models):
+            choice = int(raw) - 1
+            break
+        print(f"  Enter a number between 1 and {len(models)}.")
+
+    chosen = models[choice]
+    set_weights(chosen)
+    print(f"Using: {chosen.name}")
+    print()
+    return chosen
 
 
 def require_pyspin() -> None:
@@ -554,6 +669,91 @@ def _downscale_rgb(rgb: np.ndarray, max_width: int) -> np.ndarray:
     return cv2.resize(rgb, (max_width, nh), interpolation=cv2.INTER_AREA)
 
 
+def list_dshow_device_names(max_index: int = 12) -> list[str]:
+    """Best-effort DirectShow capture names via PowerShell (Windows)."""
+    if sys.platform != "win32":
+        return []
+    import subprocess
+
+    script = (
+        "Get-CimInstance Win32_PnPEntity | "
+        "Where-Object { $_.PNPClass -eq 'Camera' -and $_.Status -eq 'OK' } | "
+        "Select-Object -ExpandProperty Name"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        return []
+    names = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    return names[:max_index]
+
+
+def find_opencv_camera_index(
+    preferred_name: str | None = None,
+    *,
+    fallback: int = 0,
+    max_index: int = 12,
+) -> tuple[int, str | None]:
+    """Resolve a DirectShow index. Match ``preferred_name`` when possible."""
+    wanted = (preferred_name or "").strip()
+    names = list_dshow_device_names(max_index=max_index)
+    if wanted and names:
+        lower = wanted.lower()
+        for i, name in enumerate(names):
+            if lower in name.lower():
+                return i, name
+    if wanted:
+        # Some OpenCV builds accept "video=<FriendlyName>"; probe once.
+        probe = cv2.VideoCapture(f"video={wanted}", cv2.CAP_DSHOW)
+        ok = bool(probe.isOpened())
+        probe.release()
+        if ok:
+            return fallback, wanted
+    if names and 0 <= fallback < len(names):
+        return fallback, names[fallback]
+    return fallback, None
+
+
+def _fourcc_mjpeg() -> int:
+    return cv2.VideoWriter_fourcc(*"MJPG")
+
+
+def configure_opencv_capture(cap: cv2.VideoCapture, *, width: int, height: int) -> str:
+    """Request MJPEG + low latency for the ELP UVC global shutter."""
+    notes: list[str] = []
+    try:
+        if cap.set(cv2.CAP_PROP_FOURCC, _fourcc_mjpeg()):
+            notes.append("MJPEG")
+    except Exception:
+        pass
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    if width > 0 and height > 0:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    notes.append(f"{got_w}x{got_h}")
+    return ", ".join(notes)
+
+
+def _opencv_capture_size(*, high: bool) -> tuple[int, int]:
+    size = (
+        tuple(globals().get("OPENCV_HQ_SIZE", (1920, 1200)))
+        if high
+        else tuple(globals().get("OPENCV_FAST_SIZE", (1280, 720)))
+    )
+    return int(size[0]), int(size[1])
+
+
 class LiveCamera:
     """Live camera via Spinnaker, OpenCV DirectShow, or a video file."""
 
@@ -579,6 +779,7 @@ class LiveCamera:
         self._enum_cache: dict[str, str] = {}
         self.last_native_hw: tuple[int, int] | None = None
         self.last_grab_ms = 0.0
+        self.opencv_device_name: str | None = None
 
     def open(self) -> None:
         if self.backend == "video":
@@ -591,9 +792,28 @@ class LiveCamera:
             return
 
         if self.backend == "opencv":
+            preferred = str(globals().get("OPENCV_CAMERA_NAME", "") or "").strip()
+            index, name = find_opencv_camera_index(
+                preferred, fallback=int(self.index)
+            )
+            self.index = index
+            self.opencv_device_name = name or preferred or None
+            # OpenCV 5 on this machine cannot open DirectShow by friendly name;
+            # use the matched numeric index (fallback CAMERA_INDEX).
             self._cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+            if not self._cap.isOpened() and preferred:
+                self._cap.release()
+                self._cap = cv2.VideoCapture(f"video={preferred}", cv2.CAP_DSHOW)
             if not self._cap.isOpened():
-                raise RuntimeError(f"OpenCV could not open camera index {self.index}")
+                raise RuntimeError(
+                    f"OpenCV could not open camera index {self.index}"
+                    + (f" ({self.opencv_device_name})" if self.opencv_device_name else "")
+                )
+            high = not bool(globals().get("FAST_LIVE", False))
+            width, height = _opencv_capture_size(high=high)
+            note = configure_opencv_capture(self._cap, width=width, height=height)
+            label = self.opencv_device_name or f"index {self.index}"
+            print(f"OpenCV camera: {label} @ {note}")
             return
 
         if self.backend == "spinnaker":
@@ -671,8 +891,12 @@ class LiveCamera:
         raise ValueError(f"Unknown backend: {self.backend}")
 
     def set_quality_mode(self, high: bool) -> None:
-        """HQ_LINEAR demosaic. Color correction is owned by ``set_color_correction``."""
-        del high
+        """Switch grab quality. OpenCV retargets MJPEG size; Spinnaker keeps HQ demosaic."""
+        if self.backend == "opencv" and self._cap is not None:
+            width, height = _opencv_capture_size(high=bool(high))
+            note = configure_opencv_capture(self._cap, width=width, height=height)
+            print(f"OpenCV quality: {'HQ' if high else 'FAST'} ({note})")
+            return
         if self.backend != "spinnaker" or self._processor is None:
             return
         import PySpin
@@ -912,8 +1136,19 @@ def list_spinnaker_cameras() -> list[str]:
     return names
 
 
-def list_opencv_cameras(max_index: int = 4) -> list[str]:
+def list_opencv_cameras(max_index: int = 8) -> list[str]:
     found: list[str] = []
+    names = list_dshow_device_names(max_index=max_index)
+    preferred = str(globals().get("OPENCV_CAMERA_NAME", "") or "").strip()
+    if preferred:
+        found.append(f"[name] {preferred}")
+    for i, name in enumerate(names):
+        if preferred and preferred.lower() in name.lower():
+            continue
+        found.append(f"[{i}] {name}")
+    if found:
+        return found
+
     prev_log = cv2.getLogLevel() if hasattr(cv2, "getLogLevel") else None
     try:
         if hasattr(cv2, "setLogLevel"):
@@ -931,8 +1166,9 @@ def list_opencv_cameras(max_index: int = 4) -> list[str]:
     return found
 
 
-def print_cameras(*, include_opencv: bool = False) -> None:
-    print("Spinnaker cameras:", list_spinnaker_cameras() or ["(none)"])
+def print_cameras(*, include_opencv: bool = False, include_spinnaker: bool = True) -> None:
+    if include_spinnaker:
+        print("Spinnaker cameras:", list_spinnaker_cameras() or ["(none)"])
     if include_opencv:
         print("OpenCV cameras:", list_opencv_cameras() or ["(none)"])
 
@@ -940,19 +1176,19 @@ def print_cameras(*, include_opencv: bool = False) -> None:
 def prepare() -> None:
     """Print env, verify PySpin if needed, and list cameras."""
     print_env()
-    backend = str(globals().get("CAMERA_BACKEND", "spinnaker")).lower()
+    backend = str(globals().get("CAMERA_BACKEND", "opencv")).lower()
     if backend == "spinnaker":
         require_pyspin()
         # Do not enumerate DirectShow devices here: NVIDIA's virtual camera
         # driver dumps a wall of VCAMDS INFO/WARN/ERR lines into the console.
-        print_cameras(include_opencv=False)
+        print_cameras(include_opencv=False, include_spinnaker=True)
     elif backend == "video":
         path = Path(globals().get("VIDEO_PATH", ""))
         print("Skipping PySpin check (video backend).")
         print(f"Video source: {path}  exists={path.is_file()}")
     else:
         print("Skipping PySpin check (opencv backend).")
-        print_cameras(include_opencv=True)
+        print_cameras(include_opencv=True, include_spinnaker=False)
 
 
 def _ensure_cascade_importable() -> None:
@@ -1006,8 +1242,9 @@ def load_yolo_model():
     global model, resolved_device, class_names
     if not WEIGHTS_PATH.exists():
         raise FileNotFoundError(
-            f"Weights not ready yet:\n  {WEIGHTS_PATH}\n\n"
-            "Training is still running. Re-run after the .pt file appears."
+            f"Weights not found:\n  {WEIGHTS_PATH}\n\n"
+            "Put a .pt under weights/ (e.g. 2026-08-19_131846.pt or "
+            "halfyield-model.pt), or set PECAN_YOLO_WEIGHTS."
         )
 
     resolved_device = resolve_yolo_device(DEVICE)
@@ -1658,11 +1895,15 @@ class CameraControlPanel:
         self._quality_high = high
         apply_quality_preset(high)
         self.camera.set_quality_mode(high)
-        print(
-            "Quality: HQ (1920 / YOLO 1280)"
-            if high
-            else "Quality: FAST (960 / YOLO 640)"
-        )
+        if self.camera.backend == "opencv":
+            w, h = _opencv_capture_size(high=high)
+            print(f"Quality: {'HQ' if high else 'FAST'} grab {w}x{h}")
+        else:
+            print(
+                "Quality: HQ (1920 / YOLO 1280)"
+                if high
+                else "Quality: FAST (960 / YOLO 640)"
+            )
         return True
 
     def sync_color_corr(self) -> None:
@@ -1839,8 +2080,12 @@ class CameraControlPanel:
 
 def resolve_capture_backend() -> str:
     """Use the configured backend, or fall back to VIDEO_PATH if no camera is present."""
-    backend = str(globals().get("CAMERA_BACKEND", "spinnaker")).lower()
+    backend = str(globals().get("CAMERA_BACKEND", "opencv")).lower()
     video_path = Path(globals().get("VIDEO_PATH", "") or "")
+    if backend == "opencv":
+        return "opencv"
+    if backend == "video":
+        return "video"
     if backend != "spinnaker":
         return backend
     if list_spinnaker_cameras():
@@ -1850,8 +2095,8 @@ def resolve_capture_backend() -> str:
         globals()["CAMERA_BACKEND"] = "video"
         return "video"
     raise RuntimeError(
-        "No Spinnaker cameras detected. Set CAMERA_BACKEND='video' and VIDEO_PATH, "
-        "or plug in the Spinnaker camera."
+        "No Spinnaker cameras detected. Set CAMERA_BACKEND='opencv' for the USB "
+        "camera, or CAMERA_BACKEND='video' with VIDEO_PATH."
     )
 
 
@@ -2073,19 +2318,51 @@ def run_live_view() -> None:
 
 
 def main() -> None:
-    import argparse
-
     parser = argparse.ArgumentParser(description="Live camera / video YOLO-seg overlay")
     parser.add_argument(
         "--video",
         default=None,
         help="Play this video instead of the camera (loops until q/Esc).",
     )
+    parser.add_argument(
+        "--weights",
+        default=None,
+        help="Checkpoint under weights/ or an absolute .pt path (skips the picker).",
+    )
+    parser.add_argument(
+        "--list-weights",
+        action="store_true",
+        help="Print available weights/ checkpoints and exit.",
+    )
+    parser.add_argument(
+        "--no-choose-weights",
+        action="store_true",
+        help="Skip the interactive model picker (use default / --weights / env).",
+    )
     args = parser.parse_args()
     global CAMERA_BACKEND, VIDEO_PATH
+
+    if args.list_weights:
+        models = list_available_weights()
+        if not models:
+            print(f"No .pt files in {WEIGHTS_DIR}")
+            raise SystemExit(1)
+        for path in models:
+            mb = path.stat().st_size / (1024 * 1024)
+            print(f"{path.name}\t{mb:.1f} MB")
+        return
+
     if args.video:
         CAMERA_BACKEND = "video"
         VIDEO_PATH = Path(args.video)
+
+    if args.weights:
+        set_weights(args.weights)
+    elif os.environ.get("PECAN_YOLO_WEIGHTS"):
+        set_weights(os.environ["PECAN_YOLO_WEIGHTS"])
+    elif not args.no_choose_weights and sys.stdin.isatty():
+        choose_weights_interactive()
+
     prepare()
     load_model()
     run_live_view()

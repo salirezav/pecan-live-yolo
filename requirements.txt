@@ -1,14 +1,5 @@
-# Installed by scripts/setup_spinnaker_env.ps1 into .venv-spinnaker (Python 3.10).
-# Teledyne PySpin comes from the local Spinnaker wheel, not PyPI.
-torch
-torchvision
-ultralytics
-opencv-python
-numpy
-pillow
-segmentation-models-pytorch
-scipy
-ipykernel
-
-# Optional: cascade backend
-# napari-pecan-py  (editable install from sibling checkout)
+# Managed by uv via pyproject.toml. Prefer:
+#   uv sync
+#
+# Optional Spinnaker (Blackfly) env still uses:
+#   powershell -File scripts/setup_spinnaker_env.ps1

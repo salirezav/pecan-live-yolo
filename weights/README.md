@@ -1,17 +1,28 @@
 # Weights
 
-Copy YOLO-seg or cascade checkpoints here (or keep the plugin `training_runs/` layout).
+Local YOLO-seg / cascade checkpoints used by `scripts/live_yolo.py`.
 
-Default YOLO path (relative to repo root):
+| File | Source | Notes |
+|---|---|---|
+| `2026-08-19_131846.pt` | `pecan_py_napari/training_runs/yolo_seg_runs/...` | Default live demo YOLO-seg (pecan / kernel) |
+| `demo-yolo-seg.pt` | same file | Alias of the demo checkpoint |
+| `halfyield-model.pt` | half-yield-analysis zip (`halfyield-model.pt`) | YOLOv12n-seg: half / piece / shell / obscured |
 
-```text
-training_runs/yolo_seg_runs/<run_name>/<run_name>.pt
+## Switching models
+
+Double-click / run `scripts\run_live_yolo.bat` — it lists `weights/*.pt` and asks which to load.
+
+```bat
+scripts\run_live_yolo.bat
+scripts\run_live_yolo.bat --weights halfyield-model.pt
+scripts\run_live_yolo.bat --list-weights
 ```
 
-Or set env vars before launch:
+Notebook / Python:
 
-- `PECAN_YOLO_WEIGHTS` — path to a `.pt` YOLO-seg checkpoint
-- `PECAN_CASCADE_WEIGHTS` — path to a cascade U-Net checkpoint
-- `PECAN_YOLO_RUN` — run folder name under `training_runs/yolo_seg_runs/`
+```python
+live.set_weights("halfyield-model.pt")
+# live.set_weights("2026-08-19_131846")  # demo pecan/kernel
+```
 
-Cascade mode needs an installed `napari-pecan-py` (provides `pecanpy.widgets.cascade_seg`).
+Also accepted: `PECAN_YOLO_WEIGHTS`, `PECAN_YOLO_RUN`, `PECAN_CASCADE_WEIGHTS`.
